@@ -1,0 +1,11 @@
+[package]
+name = "http-signatures"
+version = "0.1.0"
+authors = ["Tim Eggert <tim.eggert@celeraone.com>"]
+
+[dependencies]
+base64 = "0.9.0"
+time = "0.1"
+regex = "0.2"
+rust-crypto = "0.2.36"
+itertools = "0.7.7"
