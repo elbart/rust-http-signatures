@@ -6,10 +6,13 @@ extern crate time;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::str;
 
 use base64::encode as b64_encode;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
+use crypto::hmac::Hmac;
+use crypto::mac::Mac;
 use itertools::Itertools;
 use time::now_utc;
 use regex::Regex;
@@ -20,7 +23,7 @@ use regex::Regex;
 struct HTTPHeader(String, String);
 
 /// Wraps common HTTP methods
-enum HTTPMethod {
+pub enum HTTPMethod {
     HEAD,
     GET,
     POST,
@@ -32,6 +35,13 @@ enum HTTPMethod {
     OPTIONS,
     TRACE,
 }
+
+/// Supported signature algorithms
+pub enum SignatureAlgorithm {
+    RSA_SHA256,
+    HMAC_SHA256,
+}
+
 
 /// Implement the fmt::Display trait to be able to
 /// represent all values as strings.
@@ -56,7 +66,7 @@ impl fmt::Display for HTTPMethod {
 
 /// Central HTTP Request type which is passed to an
 /// HTTP Signature Implementation
-struct HTTPRequest {
+pub struct HTTPRequest {
     headers: HashMap<String, String>,
     method: HTTPMethod,
     host_name: String,
@@ -69,13 +79,19 @@ struct HTTPRequest {
 /// See https://tools.ietf.org/html/draft-cavage-http-signatures-00.
 /// There are more drafts, so a trait might be good to use and then
 /// provide different implementations for that.
-struct HTTPSignaturesImplementation {
+pub struct HTTPSignaturesImplementation00 {
     key_id: String,
     secret: String,
     default_headers_to_sign: Vec<String>,
+    algorithm: SignatureAlgorithm,
 }
 
-impl HTTPSignaturesImplementation {
+pub trait HTTPSignature {
+    fn sign_request(&self, req: &HTTPRequest, alg: SignatureAlgorithm) -> Result<String, String>;
+}
+
+impl HTTPSignaturesImplementation00 {
+    /// process the headers which need to be signed
     fn process_headers_to_sign(&self, req: &HTTPRequest) -> Vec<HTTPHeader> {
         let mut result: Vec<HTTPHeader> = Vec::new();
 
@@ -109,17 +125,20 @@ impl HTTPSignaturesImplementation {
         result
     }
 
+    /// actually creates the signature.
     fn get_signature(
         &self,
         req: &HTTPRequest,
+        alg: SignatureAlgorithm,
         headers: &Vec<HTTPHeader>,
     ) -> Result<String, String> {
         let string = self.get_string_to_sign(&req, headers);
-        let mut hasher = Sha256::new();
-        hasher.input_str(&string.unwrap());
-        Ok(b64_encode(&hasher.result_str()))
+        let mut hasher = Hmac::new(Sha256::new(), self.secret.as_ref());
+        hasher.input(string.unwrap().as_bytes());
+        Ok(b64_encode(&hasher.result().code()))
     }
 
+    /// produces the string sequence, which need to be signed.
     fn get_string_to_sign(
         &self,
         req: &HTTPRequest,
@@ -143,19 +162,21 @@ impl HTTPSignaturesImplementation {
 
         Ok(result_string.trim().to_string())
     }
+}
 
+impl HTTPSignature for HTTPSignaturesImplementation00 {
     /// Signs the passed http request and returns a signature string
-    pub fn sign_request(&self, req: &HTTPRequest) -> Result<String, String> {
+    fn sign_request(&self, req: &HTTPRequest, alg: SignatureAlgorithm) -> Result<String, String> {
         let headers_to_sign = self.process_headers_to_sign(req);
 
         let headers_string = headers_to_sign.iter().map(|x| &x.0).join(" ");
 
-        let signature = self.get_signature(&req, &headers_to_sign);
+        let signature = self.get_signature(&req, alg, &headers_to_sign);
         let result = format!(
             concat!(
                 "Signature keyId=\"{0}\",",
                 "algorithm=\"hmac-sha256\",",
-                "headers=\"{1}\",",
+                "headers=\"request-line {1}\",",
                 "signature=\"{2}\""
             ),
             self.key_id,
@@ -199,16 +220,17 @@ mod tests {
         }
     }
 
-    fn new_signature_implementation() -> HTTPSignaturesImplementation {
+    fn new_signature_implementation() -> HTTPSignaturesImplementation00 {
         let mut default_headers = Vec::new();
-        default_headers.push("date".to_string());
         default_headers.push("host".to_string());
+        default_headers.push("date".to_string());
         default_headers.push("content-md5".to_string());
 
-        HTTPSignaturesImplementation {
+        HTTPSignaturesImplementation00 {
             key_id: "mykey".to_string(),
             secret: "mysecret".to_string(),
             default_headers_to_sign: default_headers,
+            algorithm: SignatureAlgorithm::HMAC_SHA256,
         }
     }
 
@@ -220,11 +242,11 @@ mod tests {
         let result = signer.process_headers_to_sign(&request);
         assert_eq!(result.len(), 2);
 
-        assert_eq!(result[0].0, "date");
+        assert_eq!(&result[0].1, "elbart.com");
+        assert_eq!(result[1].0, "date");
 
         let re = Regex::new(r"^[\w]{3}, \d{1,2} [\w]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$").unwrap();
-        assert!(re.is_match(&result[0].1));
-        assert_eq!(&result[1].1, "elbart.com");
+        assert!(re.is_match(&result[1].1));
     }
 
     #[test]
@@ -235,8 +257,8 @@ mod tests {
         let result = signer.process_headers_to_sign(&request);
         assert_eq!(result.len(), 3);
 
-        assert_eq!(&result[0].1, "2018-03-23");
-        assert_eq!(&result[1].1, "elbart.com");
+        assert_eq!(&result[0].1, "elbart.com");
+        assert_eq!(&result[1].1, "2018-03-23");
         assert_eq!(&result[2].1, &b64_encode("this is the body"));
     }
 
@@ -248,7 +270,7 @@ mod tests {
         let headers = signer.process_headers_to_sign(&request);
         let result = signer.get_string_to_sign(&request, &headers);
 
-        assert_eq!(result.unwrap(), "POST /api/services?a=b&c=d HTTP/1.1\ndate: 2018-03-23\nhost: elbart.com\ncontent-md5: dGhpcyBpcyB0aGUgYm9keQ==");
+        assert_eq!(result.unwrap(), "POST /api/services?a=b&c=d HTTP/1.1\nhost: elbart.com\ndate: 2018-03-23\ncontent-md5: dGhpcyBpcyB0aGUgYm9keQ==");
     }
 
     #[test]
@@ -256,8 +278,8 @@ mod tests {
         let request = new_request(HTTPMethod::POST);
         let signer = new_signature_implementation();
 
-        let result = signer.sign_request(&request);
+        let result = signer.sign_request(&request, SignatureAlgorithm::HMAC_SHA256);
 
-        assert_eq!(result.unwrap(), "Signature keyId=\"mykey\",algorithm=\"hmac-sha256\",headers=\"date host content-md5\",signature=\"ZWE0ZTRkYmYzMTlkZWEyMGQwN2Q2NDY3MGQ1MzZiN2FjZjNhOWZjNGRkNDhlNTNlM2QxMDMzYTQ3ZTQ0NzY4Zg==\"");
+        assert_eq!(result.unwrap(), "Signature keyId=\"mykey\",algorithm=\"hmac-sha256\",headers=\"request-line host date content-md5\",signature=\"Kk6xmzbl7IjSyA+MJugSS+emO+gLTwxxdQUPTScOB+k=\"");
     }
 }
